@@ -9,8 +9,7 @@ use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::sql::server::FlightSqlService;
 use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt, SqlInfo, TicketStatementQuery};
 use arrow_flight::{
-    FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, Location,
-    Ticket,
+    FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, Ticket,
 };
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, Float32Array, Int64Array, Int8Array, RecordBatch};
@@ -29,60 +28,9 @@ use tonic::transport::Server;
 use tonic::{Extensions, Request, Response, Status, Streaming};
 
 use datafusion_table_providers::flight::sql::FlightSqlDriver;
-use datafusion_table_providers::flight::{
-    FlightAuthentication, FlightAuthenticationProvider, FlightFactoryOptions, FlightProperties,
-    FlightTableFactory,
-};
-
-mod channel_provider;
-mod size_limits;
-mod sql_provider;
-mod timeouts;
-
-const QUERY: &str = "SELECT id FROM test";
+use datafusion_table_providers::flight::{FlightProperties, FlightTableFactory};
 
 const AUTH_HEADER: &str = "authorization";
-
-#[derive(Debug)]
-struct FixtureExecutionAuthentication(FlightAuthentication);
-
-impl FlightAuthenticationProvider for FixtureExecutionAuthentication {
-    fn restore(
-        &self,
-        _authentication: &FlightAuthentication,
-        _origin: &str,
-        _tickets: &[&[u8]],
-    ) -> datafusion::common::Result<FlightAuthentication> {
-        Ok(self.0.clone())
-    }
-}
-
-#[derive(Debug)]
-struct FixtureAuthenticationProvider;
-
-impl FlightAuthenticationProvider for FixtureAuthenticationProvider {
-    fn restore(
-        &self,
-        authentication: &FlightAuthentication,
-        _origin: &str,
-        _tickets: &[&[u8]],
-    ) -> datafusion::common::Result<FlightAuthentication> {
-        match authentication {
-            FlightAuthentication::UsernamePassword { .. } => {
-                Ok(FlightAuthentication::UsernamePassword {
-                    username: None,
-                    password: None,
-                    authorization: Some(BEARER_TOKEN.into()),
-                })
-            }
-            FlightAuthentication::BearerToken { .. } => {
-                Err(datafusion::common::DataFusionError::Execution(
-                    "missing original fixture authorization".into(),
-                ))
-            }
-        }
-    }
-}
 const BEARER_TOKEN: &str = "Bearer flight-sql-token";
 
 struct TestFlightSqlService {
@@ -91,7 +39,6 @@ struct TestFlightSqlService {
     expected_handshake_headers: HashMap<String, String>,
     expected_flight_info_query: String,
     shutdown_sender: Option<Sender<()>>,
-    handshake_error: Option<Status>,
 }
 
 impl TestFlightSqlService {
@@ -121,52 +68,6 @@ impl Drop for TestFlightSqlService {
             tx.send(()).ok();
         }
     }
-}
-
-fn batch(value: i64) -> RecordBatch {
-    RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
-        vec![Arc::new(Int64Array::from(vec![value]))],
-    )
-    .unwrap()
-}
-
-fn test_service(partition_data: RecordBatch, locations: Vec<Vec<&str>>) -> TestFlightSqlService {
-    let mut flight_info = FlightInfo::new()
-        .try_with_schema(partition_data.schema().as_ref())
-        .unwrap();
-    let ticket = Ticket::new(TicketStatementQuery::default().as_any().encode_to_vec());
-    for locations in locations {
-        let mut endpoint = FlightEndpoint::new().with_ticket(ticket.clone());
-        endpoint.location = locations
-            .into_iter()
-            .map(|uri| Location { uri: uri.into() })
-            .collect();
-        flight_info = flight_info.with_endpoint(endpoint);
-    }
-    TestFlightSqlService {
-        flight_info,
-        partition_data,
-        expected_handshake_headers: HashMap::new(),
-        expected_flight_info_query: QUERY.into(),
-        shutdown_sender: None,
-        handshake_error: None,
-    }
-}
-
-async fn start_service(service: TestFlightSqlService) -> (String, Sender<()>) {
-    let (tx, rx) = channel();
-    let address = service.run_in_background(rx).await;
-    (format!("http://{address}"), tx)
-}
-
-fn options() -> HashMap<String, String> {
-    HashMap::from([("flight.sql.query".into(), QUERY.into())])
-}
-
-fn properties() -> FlightProperties {
-    FlightProperties::new()
-        .with_authentication(FlightAuthentication::username_password("admin", "password"))
 }
 
 fn check_header<T>(request: &Request<T>, rpc: &str, header_name: &str, expected_value: &str) {
@@ -199,9 +100,6 @@ impl FlightSqlService for TestFlightSqlService {
         Response<Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>>,
         Status,
     > {
-        if let Some(error) = &self.handshake_error {
-            return Err(error.clone());
-        }
         for (header_name, expected_value) in self.expected_handshake_headers.iter() {
             check_header(&request, "do_handshake", header_name, expected_value);
         }
@@ -290,30 +188,26 @@ async fn test_flight_sql_data_source() -> datafusion::common::Result<()> {
         ]),
         expected_flight_info_query: query.into(),
         shutdown_sender: Some(tx),
-        handshake_error: None,
     };
     let port = service.run_in_background(rx).await.port();
     let ctx = SessionContext::new();
-    let properties = properties()
-        .with_reusable_flight_info(true)
-        .with_grpc_headers(HashMap::from([
-            ("custom-hdr1".into(), "default".into()),
-            ("custom-hdr2".into(), "v2".into()),
-        ]));
-    let factory = FlightTableFactory::new(Arc::new(FlightSqlDriver::new()))
-        .with_options(FlightFactoryOptions::new().with_properties(properties));
-    ctx.state_ref()
-        .write()
-        .table_factories_mut()
-        .insert("FLIGHT_SQL".into(), Arc::new(factory));
+    let props_template = FlightProperties::new().with_reusable_flight_info(true);
+    let driver = FlightSqlDriver::new().with_properties_template(props_template);
+    ctx.state_ref().write().table_factories_mut().insert(
+        "FLIGHT_SQL".into(),
+        Arc::new(FlightTableFactory::new(Arc::new(driver))),
+    );
     let _ = ctx
         .sql(&format!(
             r#"
         CREATE EXTERNAL TABLE fsql STORED AS FLIGHT_SQL
         LOCATION 'http://localhost:{port}'
         OPTIONS(
+            'flight.sql.username' 'admin',
+            'flight.sql.password' 'password',
             'flight.sql.query' '{query}',
             'flight.sql.header.custom-hdr1' 'v1',
+            'flight.sql.header.custom-hdr2' 'v2',
         )"#
         ))
         .await
