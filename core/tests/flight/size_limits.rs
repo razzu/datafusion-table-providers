@@ -15,7 +15,7 @@ use futures::{stream, TryStreamExt};
 use prost::Message;
 use rstest::rstest;
 
-use super::{batch, options, start_service, test_service, QUERY};
+use super::{batch, options, properties, start_service, test_service, QUERY};
 
 fn limits(encoding: bool, size: usize) -> SizeLimits {
     if encoding {
@@ -45,7 +45,11 @@ async fn test_metadata_message_size_limits(#[case] encoding: bool, #[case] overf
     let limit = size - overflow;
     let (endpoint, _shutdown) = start_service(service).await;
     let result = FlightTableFactory::new(Arc::new(FlightSqlDriver::new()))
-        .with_options(FlightFactoryOptions::new().with_size_limits(limits(encoding, limit)))
+        .with_options(
+            FlightFactoryOptions::new()
+                .with_properties(properties())
+                .with_size_limits(limits(encoding, limit)),
+        )
         .open_table(endpoint, options())
         .await;
     if overflow == 0 {
@@ -102,13 +106,18 @@ async fn test_do_get_message_size_limits(#[case] encoding: bool, #[case] overflo
     let limit = size - overflow;
     let (endpoint, _shutdown) = start_service(service).await;
     let table = FlightTableFactory::new(Arc::new(FlightSqlDriver::new()))
-        .with_options(FlightFactoryOptions::new().with_size_limits(limits(encoding, limit)))
+        .with_options(
+            FlightFactoryOptions::new()
+                .with_properties(properties())
+                .with_size_limits(limits(encoding, limit)),
+        )
         .open_table(endpoint, options())
         .await
         .unwrap();
     let ctx = SessionContext::new();
     let plan = table.scan(&ctx.state(), None, &[], None).await.unwrap();
-    let codec = FlightPhysicalCodec::default();
+    let codec = FlightPhysicalCodec::default()
+        .with_authentication_provider(std::sync::Arc::new(super::FixtureAuthenticationProvider));
     let mut bytes = vec![];
     codec.try_encode(plan, &mut bytes).unwrap();
     let plan = codec
@@ -134,6 +143,7 @@ async fn test_default_limits_allow_metadata_above_tonic_default() {
     service.flight_info.app_metadata = vec![0; 4 * 1024 * 1024].into();
     let (endpoint, _shutdown) = start_service(service).await;
     let table = FlightTableFactory::new(Arc::new(FlightSqlDriver::new()))
+        .with_options(FlightFactoryOptions::new().with_properties(properties()))
         .open_table(endpoint, options())
         .await
         .unwrap();

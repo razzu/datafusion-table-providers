@@ -20,7 +20,9 @@
 use std::sync::Arc;
 
 use crate::exec::{FlightConfig, FlightExec};
-use crate::{to_df_err, DefaultFlightChannelProvider, FlightChannelProvider};
+use crate::{
+    to_df_err, DefaultFlightChannelProvider, FlightAuthenticationProvider, FlightChannelProvider,
+};
 use datafusion::common::DataFusionError;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
@@ -30,12 +32,14 @@ use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 #[derive(Clone, Debug)]
 pub struct FlightPhysicalCodec {
     channel_provider: Arc<dyn FlightChannelProvider>,
+    authentication_provider: Option<Arc<dyn FlightAuthenticationProvider>>,
 }
 
 impl Default for FlightPhysicalCodec {
     fn default() -> Self {
         Self {
             channel_provider: Arc::new(DefaultFlightChannelProvider),
+            authentication_provider: None,
         }
     }
 }
@@ -52,6 +56,15 @@ impl FlightPhysicalCodec {
         self.channel_provider = channel_provider;
         self
     }
+
+    /// Restore runtime authentication from caller-supplied provider state.
+    pub fn with_authentication_provider(
+        mut self,
+        provider: Arc<dyn FlightAuthenticationProvider>,
+    ) -> Self {
+        self.authentication_provider = Some(provider);
+        self
+    }
 }
 
 impl PhysicalExtensionCodec for FlightPhysicalCodec {
@@ -62,7 +75,8 @@ impl PhysicalExtensionCodec for FlightPhysicalCodec {
         _registry: &TaskContext,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         if inputs.is_empty() {
-            let config: FlightConfig = serde_json::from_slice(buf).map_err(to_df_err)?;
+            let mut config: FlightConfig = serde_json::from_slice(buf).map_err(to_df_err)?;
+            config.restore_authentication(self.authentication_provider.as_deref())?;
             Ok(Arc::new(FlightExec::from_config(
                 config,
                 self.channel_provider.clone(),
@@ -80,6 +94,7 @@ impl PhysicalExtensionCodec for FlightPhysicalCodec {
         buf: &mut Vec<u8>,
     ) -> datafusion::common::Result<()> {
         if let Some(flight) = node.downcast_ref::<FlightExec>() {
+            flight.config().properties.validate_execution()?;
             let mut bytes = serde_json::to_vec(flight.config()).map_err(to_df_err)?;
             buf.append(&mut bytes);
             Ok(())
@@ -153,10 +168,7 @@ mod tests {
             let properties = FlightProperties::new()
                 .with_reusable_flight_info(true)
                 .with_unbounded_streams(true)
-                .with_grpc_headers(HashMap::from([
-                    ("authorization".into(), "Bearer fixture".into()),
-                    ("x-fixture".into(), "codec".into()),
-                ]));
+                .with_grpc_headers(HashMap::from([("x-fixture".into(), "codec".into())]));
             let metadata = FlightMetadata::try_new(info, properties).unwrap();
             let exec = FlightExec::try_new(
                 &metadata,
@@ -188,10 +200,10 @@ mod tests {
                     "properties": {
                         "unbounded_streams": true,
                         "grpc_headers": {
-                            "authorization": "Bearer fixture",
                             "x-fixture": "codec"
                         },
-                        "reusable_flight_info": true
+                        "reusable_flight_info": true,
+                        "authentication": null
                     },
                     "size_limits": {"encoding": 1024, "decoding": 2048}
                 })

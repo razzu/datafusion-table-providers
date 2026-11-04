@@ -19,27 +19,23 @@
 
 use std::collections::HashMap;
 
-use arrow_flight::error::Result;
+use arrow_flight::error::{FlightError, Result};
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
 use tonic::transport::Channel;
 
-use crate::{FlightDriver, FlightMetadata, FlightProperties};
+use crate::{FlightAuthentication, FlightDriver, FlightMetadata, FlightProperties};
 
 pub const QUERY: &str = "flight.sql.query";
-pub const USERNAME: &str = "flight.sql.username";
-pub const PASSWORD: &str = "flight.sql.password";
 pub const HEADER_PREFIX: &str = "flight.sql.header.";
 
 /// Default Flight SQL driver. Requires a [QUERY] to be passed as a table option.
-/// If [USERNAME] (and optionally [PASSWORD]) are passed,
-/// will perform the `Handshake` using basic authentication.
+/// Authentication is supplied through [`FlightProperties::with_authentication`].
 /// Any additional headers for the `GetFlightInfo` call can be passed as table options
 /// using the [HEADER_PREFIX] prefix.
 /// If a token is returned by the server with the handshake response, it will be
-/// stored as a gRPC authorization header within the returned [FlightMetadata],
-/// to be sent with the subsequent `DoGet` requests.
+/// retained as runtime-only authentication in the returned [FlightMetadata].
 #[derive(Clone, Debug, Default)]
 pub struct FlightSqlDriver {
     persistent_headers: bool,
@@ -55,6 +51,21 @@ impl FlightSqlDriver {
         self.persistent_headers = persistent_headers;
         self
     }
+
+    async fn authenticate_username_password(
+        client: &mut FlightSqlServiceClient<Channel>,
+        username: &str,
+        password: Option<&str>,
+    ) -> Result<()> {
+        client
+            .handshake(username, password.unwrap_or_default())
+            .await?;
+        Ok(())
+    }
+
+    fn authenticate_bearer(client: &mut FlightSqlServiceClient<Channel>, token: &str) {
+        client.set_header("authorization", token);
+    }
 }
 
 #[async_trait]
@@ -62,33 +73,58 @@ impl FlightDriver for FlightSqlDriver {
     async fn metadata(
         &self,
         client: FlightServiceClient<Channel>,
-        properties: FlightProperties,
+        mut properties: FlightProperties,
         options: &HashMap<String, String>,
     ) -> Result<FlightMetadata> {
         let mut client = FlightSqlServiceClient::new_from_inner(client);
-        let mut handshake_headers = properties.grpc_headers().clone();
+        let mut headers = properties.grpc_headers().clone();
         let headers_overlay = options.iter().filter_map(|(key, value)| {
             key.strip_prefix(HEADER_PREFIX)
                 .map(|header_name| (header_name.to_owned(), value.to_owned()))
         });
-        handshake_headers.extend(headers_overlay);
-        for (name, value) in &handshake_headers {
+        headers.extend(headers_overlay);
+        for (name, value) in &headers {
             client.set_header(name, value)
         }
-        if let Some(username) = options.get(USERNAME) {
-            let default_password = "".to_string();
-            let password = options.get(PASSWORD).unwrap_or(&default_password);
-            client.handshake(username, password).await?;
+
+        let mut authentication = properties.authentication.take();
+        if let Some(authentication) = &authentication {
+            authentication
+                .validate_credentials()
+                .map_err(|error| FlightError::ProtocolError(error.to_string()))?;
         }
-        let info = client.execute(options[QUERY].clone(), None).await?;
-        let mut partition_headers = if self.persistent_headers {
-            handshake_headers
+
+        let info = match &mut authentication {
+            Some(FlightAuthentication::BearerToken { token: Some(token) }) => {
+                Self::authenticate_bearer(&mut client, token);
+                client.execute(options[QUERY].clone(), None).await?
+            }
+            Some(FlightAuthentication::UsernamePassword {
+                username: Some(username),
+                password,
+                authorization,
+            }) => {
+                Self::authenticate_username_password(&mut client, username, password.as_deref())
+                    .await?;
+                let info = client.execute(options[QUERY].clone(), None).await?;
+                *authorization = client.token().map(|token| format!("Bearer {token}"));
+                info
+            }
+            Some(_) => {
+                return Err(FlightError::ProtocolError(
+                    "Flight authentication credentials are unresolved".into(),
+                ));
+            }
+            None => client.execute(options[QUERY].clone(), None).await?,
+        };
+        properties.authentication = authentication;
+
+        let partition_headers = if self.persistent_headers {
+            headers
         } else {
             HashMap::default()
         };
-        if let Some(token) = client.token() {
-            partition_headers.insert("authorization".into(), format!("Bearer {token}"));
-        }
+
         let props = properties.with_grpc_headers(partition_headers);
         FlightMetadata::try_new(info, props)
     }

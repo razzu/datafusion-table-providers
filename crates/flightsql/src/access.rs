@@ -44,6 +44,7 @@ pub(crate) async fn connect_and_fetch_metadata(
             .metadata(client.clone(), factory_options.properties.clone(), options)
             .await
             .map_err(to_df_err)?;
+        metadata.props.validate_execution()?;
         Ok((client, metadata))
     })
     .await
@@ -57,10 +58,12 @@ pub(crate) async fn fetch_metadata(
     options: &HashMap<String, String>,
 ) -> Result<FlightMetadata> {
     with_metadata_timeout(origin, factory_options.metadata_timeout, async {
-        driver
+        let metadata = driver
             .metadata(client, factory_options.properties.clone(), options)
             .await
-            .map_err(to_df_err)
+            .map_err(to_df_err)?;
+        metadata.props.validate_execution()?;
+        Ok(metadata)
     })
     .await
 }

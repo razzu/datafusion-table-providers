@@ -13,7 +13,7 @@ use datafusion::physical_plan::execution_plan::Boundedness;
 use datafusion::prelude::SessionContext;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use datafusion_table_providers::flight::codec::FlightPhysicalCodec;
-use datafusion_table_providers::flight::sql::{FlightSqlDriver, HEADER_PREFIX};
+use datafusion_table_providers::flight::sql::FlightSqlDriver;
 use datafusion_table_providers::flight::{
     FlightChannelProvider, FlightDriver, FlightFactoryOptions, FlightMetadata, FlightProperties,
     FlightTableFactory,
@@ -24,7 +24,7 @@ use tokio::time::{sleep, Instant};
 use tonic::transport::Channel;
 use tonic::Status;
 
-use super::{batch, options, start_service, test_service, AUTH_HEADER, BEARER_TOKEN};
+use super::{batch, options, properties, start_service, test_service};
 
 const ORIGIN: &str = "http://origin.invalid";
 
@@ -288,7 +288,8 @@ async fn concurrent_refreshes_keep_options_immutable() {
         .unwrap()
         .unwrap();
 
-    let codec = FlightPhysicalCodec::default();
+    let codec = FlightPhysicalCodec::default()
+        .with_authentication_provider(std::sync::Arc::new(super::FixtureAuthenticationProvider));
     for (plan, call) in [(first_plan, 1), (second_plan, 2)] {
         assert_eq!(plan.schema(), batch(7).schema());
         assert_eq!(
@@ -314,9 +315,9 @@ async fn test_handshake_failure_is_not_ignored() {
     let mut service = test_service(batch(7), vec![vec![]]);
     service.handshake_error = Some(Status::unauthenticated("handshake rejected"));
     let (endpoint, _shutdown) = start_service(service).await;
-    let mut options = options();
-    options.insert(format!("{HEADER_PREFIX}{AUTH_HEADER}"), BEARER_TOKEN.into());
+    let options = options();
     let error = FlightTableFactory::new(Arc::new(FlightSqlDriver::new()))
+        .with_options(FlightFactoryOptions::new().with_properties(properties()))
         .open_table(endpoint, options)
         .await
         .unwrap_err();

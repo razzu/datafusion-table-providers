@@ -8,14 +8,17 @@ use datafusion::prelude::SessionContext;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use datafusion_table_providers::flight::codec::FlightPhysicalCodec;
 use datafusion_table_providers::flight::sql::FlightSqlDriver;
-use datafusion_table_providers::flight::{FlightChannelProvider, FlightTableFactory};
+use datafusion_table_providers::flight::{
+    FlightAuthentication, FlightChannelProvider, FlightFactoryOptions, FlightProperties,
+    FlightTableFactory,
+};
 use rstest::rstest;
 use tonic::transport::Channel;
 
-use super::{batch, options, start_service, test_service};
+use super::{batch, options, properties, start_service, test_service};
 
 const ORIGIN: &str = "http://origin.invalid";
-const DATA_LOCATION: &str = "http://data.invalid";
+const DATA_LOCATION: &str = "http://origin.invalid/data";
 
 #[derive(Debug, Default)]
 struct TestChannelProvider {
@@ -61,6 +64,7 @@ async fn test_channel_provider_for_metadata_and_execution(
     let (endpoint, _shutdown) = start_service(test_service(batch(7), locations)).await;
     let provider = TestChannelProvider::connect(&endpoint).await;
     let factory = FlightTableFactory::new(Arc::new(FlightSqlDriver::new()))
+        .with_options(FlightFactoryOptions::new().with_properties(properties()))
         .with_channel_provider(provider.clone());
     let ctx = SessionContext::new();
     let mut expected_requests = vec![];
@@ -79,6 +83,31 @@ async fn test_channel_provider_for_metadata_and_execution(
     assert_eq!(*provider.requests.lock().unwrap(), expected_requests);
 }
 
+#[rstest]
+#[case::username_password(properties())]
+#[case::bearer(
+    FlightProperties::new()
+        .with_authentication(FlightAuthentication::bearer_token(crate::flight::BEARER_TOKEN))
+)]
+#[test_log::test(tokio::test)]
+async fn test_authenticated_cross_origin_location_is_rejected(
+    #[case] properties: FlightProperties,
+) {
+    let (endpoint, _shutdown) =
+        start_service(test_service(batch(7), vec![vec!["http://data.invalid"]])).await;
+    let provider = TestChannelProvider::connect(&endpoint).await;
+    let table = FlightTableFactory::new(Arc::new(FlightSqlDriver::new()))
+        .with_options(FlightFactoryOptions::new().with_properties(properties))
+        .with_channel_provider(provider.clone())
+        .open_table(ORIGIN, options())
+        .await
+        .unwrap();
+    let ctx = SessionContext::new();
+    let plan = table.scan(&ctx.state(), None, &[], None).await.unwrap();
+    assert!(collect(plan, ctx.task_ctx()).await.is_err());
+    assert_eq!(*provider.requests.lock().unwrap(), vec![ORIGIN]);
+}
+
 #[test_log::test(tokio::test)]
 async fn test_codec_uses_worker_provider_without_changing_serialized_plan() {
     let (planner_endpoint, _planner_shutdown) =
@@ -88,6 +117,7 @@ async fn test_codec_uses_worker_provider_without_changing_serialized_plan() {
     let planner = TestChannelProvider::connect(&planner_endpoint).await;
     let worker = TestChannelProvider::connect(&worker_endpoint).await;
     let factory = FlightTableFactory::new(Arc::new(FlightSqlDriver::new()))
+        .with_options(FlightFactoryOptions::new().with_properties(properties()))
         .with_channel_provider(planner.clone());
     let table = factory
         .open_table(&planner_endpoint, options())
@@ -95,7 +125,8 @@ async fn test_codec_uses_worker_provider_without_changing_serialized_plan() {
         .unwrap();
     let ctx = SessionContext::new();
     let plan = table.scan(&ctx.state(), None, &[], None).await.unwrap();
-    let default_codec = FlightPhysicalCodec::default();
+    let default_codec = FlightPhysicalCodec::default()
+        .with_authentication_provider(std::sync::Arc::new(super::FixtureAuthenticationProvider));
     let mut bytes = vec![];
     default_codec.try_encode(plan, &mut bytes).unwrap();
     let default_plan = default_codec
@@ -138,18 +169,24 @@ async fn test_codec_uses_worker_provider_without_changing_serialized_plan() {
 async fn test_channel_acquisition_errors_propagate() {
     let failing = Arc::new(TestChannelProvider::default());
     let driver = Arc::new(FlightSqlDriver::new());
-    let factory = FlightTableFactory::new(driver.clone()).with_channel_provider(failing.clone());
+    let factory = FlightTableFactory::new(driver.clone())
+        .with_options(FlightFactoryOptions::new().with_properties(properties()))
+        .with_channel_provider(failing.clone());
     let error = factory.open_table(ORIGIN, options()).await.unwrap_err();
     assert!(matches!(error, DataFusionError::Execution(message)
         if message == "channel acquisition failed"));
 
     let (endpoint, _shutdown) = start_service(test_service(batch(7), vec![vec![]])).await;
     let provider = TestChannelProvider::connect(&endpoint).await;
-    let factory = FlightTableFactory::new(driver).with_channel_provider(provider);
+    let factory = FlightTableFactory::new(driver)
+        .with_options(FlightFactoryOptions::new().with_properties(properties()))
+        .with_channel_provider(provider);
     let table = factory.open_table(ORIGIN, options()).await.unwrap();
     let ctx = SessionContext::new();
     let plan = table.scan(&ctx.state(), None, &[], None).await.unwrap();
-    let codec = FlightPhysicalCodec::default().with_channel_provider(failing);
+    let codec = FlightPhysicalCodec::default()
+        .with_authentication_provider(std::sync::Arc::new(super::FixtureAuthenticationProvider))
+        .with_channel_provider(failing);
     let mut bytes = vec![];
     codec.try_encode(plan, &mut bytes).unwrap();
     let restored = codec

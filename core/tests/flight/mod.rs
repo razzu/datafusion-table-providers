@@ -30,7 +30,8 @@ use tonic::{Extensions, Request, Response, Status, Streaming};
 
 use datafusion_table_providers::flight::sql::FlightSqlDriver;
 use datafusion_table_providers::flight::{
-    FlightFactoryOptions, FlightProperties, FlightTableFactory,
+    FlightAuthentication, FlightAuthenticationProvider, FlightFactoryOptions, FlightProperties,
+    FlightTableFactory,
 };
 
 mod channel_provider;
@@ -41,6 +42,47 @@ mod timeouts;
 const QUERY: &str = "SELECT id FROM test";
 
 const AUTH_HEADER: &str = "authorization";
+
+#[derive(Debug)]
+struct FixtureExecutionAuthentication(FlightAuthentication);
+
+impl FlightAuthenticationProvider for FixtureExecutionAuthentication {
+    fn restore(
+        &self,
+        _authentication: &FlightAuthentication,
+        _origin: &str,
+        _tickets: &[&[u8]],
+    ) -> datafusion::common::Result<FlightAuthentication> {
+        Ok(self.0.clone())
+    }
+}
+
+#[derive(Debug)]
+struct FixtureAuthenticationProvider;
+
+impl FlightAuthenticationProvider for FixtureAuthenticationProvider {
+    fn restore(
+        &self,
+        authentication: &FlightAuthentication,
+        _origin: &str,
+        _tickets: &[&[u8]],
+    ) -> datafusion::common::Result<FlightAuthentication> {
+        match authentication {
+            FlightAuthentication::UsernamePassword { .. } => {
+                Ok(FlightAuthentication::UsernamePassword {
+                    username: None,
+                    password: None,
+                    authorization: Some(BEARER_TOKEN.into()),
+                })
+            }
+            FlightAuthentication::BearerToken { .. } => {
+                Err(datafusion::common::DataFusionError::Execution(
+                    "missing original fixture authorization".into(),
+                ))
+            }
+        }
+    }
+}
 const BEARER_TOKEN: &str = "Bearer flight-sql-token";
 
 struct TestFlightSqlService {
@@ -119,11 +161,12 @@ async fn start_service(service: TestFlightSqlService) -> (String, Sender<()>) {
 }
 
 fn options() -> HashMap<String, String> {
-    HashMap::from([
-        ("flight.sql.query".into(), QUERY.into()),
-        ("flight.sql.username".into(), "admin".into()),
-        ("flight.sql.password".into(), "password".into()),
-    ])
+    HashMap::from([("flight.sql.query".into(), QUERY.into())])
+}
+
+fn properties() -> FlightProperties {
+    FlightProperties::new()
+        .with_authentication(FlightAuthentication::username_password("admin", "password"))
 }
 
 fn check_header<T>(request: &Request<T>, rpc: &str, header_name: &str, expected_value: &str) {
@@ -251,7 +294,7 @@ async fn test_flight_sql_data_source() -> datafusion::common::Result<()> {
     };
     let port = service.run_in_background(rx).await.port();
     let ctx = SessionContext::new();
-    let properties = FlightProperties::new()
+    let properties = properties()
         .with_reusable_flight_info(true)
         .with_grpc_headers(HashMap::from([
             ("custom-hdr1".into(), "default".into()),
@@ -269,8 +312,6 @@ async fn test_flight_sql_data_source() -> datafusion::common::Result<()> {
         CREATE EXTERNAL TABLE fsql STORED AS FLIGHT_SQL
         LOCATION 'http://localhost:{port}'
         OPTIONS(
-            'flight.sql.username' 'admin',
-            'flight.sql.password' 'password',
             'flight.sql.query' '{query}',
             'flight.sql.header.custom-hdr1' 'v1',
         )"#

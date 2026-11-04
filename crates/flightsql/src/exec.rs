@@ -23,8 +23,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::{
-    flight_service_client, to_df_err, FlightChannelProvider, FlightMetadata, FlightProperties,
-    SizeLimits,
+    flight_service_client, to_df_err, FlightAuthentication, FlightAuthenticationProvider,
+    FlightChannelProvider, FlightMetadata, FlightProperties, SizeLimits,
 };
 use arrow_flight::error::FlightError;
 use arrow_flight::{FlightClient, FlightEndpoint, Ticket};
@@ -44,11 +44,12 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion_table_providers_common::sql::db_connection_pool::runtime::run_async_with_tokio;
 use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
+use tonic::codegen::http::Uri;
 use tonic::metadata::{AsciiMetadataKey, MetadataMap};
 
 /// Arrow Flight physical plan that maps flight endpoints to partitions
 #[derive(Clone, Debug)]
-pub(crate) struct FlightExec {
+pub struct FlightExec {
     config: FlightConfig,
     channel_provider: Arc<dyn FlightChannelProvider>,
     plan_properties: Arc<PlanProperties>,
@@ -65,6 +66,7 @@ impl FlightExec {
         size_limits: SizeLimits,
         channel_provider: Arc<dyn FlightChannelProvider>,
     ) -> Result<Self> {
+        metadata.props.validate_execution()?;
         let partitions = metadata
             .info
             .endpoint
@@ -79,6 +81,10 @@ impl FlightExec {
             size_limits,
         };
         Ok(Self::from_config(config, channel_provider))
+    }
+
+    pub fn authentication(&self) -> Option<&FlightAuthentication> {
+        self.config.properties.authentication()
     }
 
     pub(crate) fn config(&self) -> &FlightConfig {
@@ -122,8 +128,23 @@ pub(crate) struct FlightConfig {
     origin: String,
     schema: SchemaRef,
     partitions: Arc<[FlightPartition]>,
-    properties: FlightProperties,
+    pub(crate) properties: FlightProperties,
     size_limits: SizeLimits,
+}
+
+impl FlightConfig {
+    pub(crate) fn restore_authentication(
+        &mut self,
+        provider: Option<&dyn FlightAuthenticationProvider>,
+    ) -> Result<()> {
+        let tickets = self
+            .partitions
+            .iter()
+            .map(|partition| partition.ticket.0.as_ref())
+            .collect::<Vec<_>>();
+        self.properties
+            .restore_authentication(provider, &self.origin, &tickets)
+    }
 }
 
 /// The minimum information required for fetching a flight stream.
@@ -177,24 +198,60 @@ impl FlightPartition {
     }
 }
 
+fn same_origin(origin: &str, destination: &str) -> bool {
+    let (Ok(origin), Ok(destination)) = (origin.parse::<Uri>(), destination.parse::<Uri>()) else {
+        return false;
+    };
+    let port = |uri: &Uri| {
+        uri.port_u16().or_else(|| match uri.scheme_str() {
+            Some("https") => Some(443),
+            Some("http") => Some(80),
+            _ => None,
+        })
+    };
+    origin.scheme() == destination.scheme()
+        && matches!(
+            (origin.host(), destination.host()),
+            (Some(origin), Some(destination)) if origin.eq_ignore_ascii_case(destination)
+        )
+        && port(&origin) == port(&destination)
+}
+
 async fn flight_client(
     source: &str,
+    config: &FlightConfig,
     grpc_headers: &MetadataMap,
-    size_limits: &SizeLimits,
     channel_provider: &dyn FlightChannelProvider,
 ) -> Result<FlightClient> {
+    config.properties.validate_execution()?;
+    if config.properties.authentication().is_some() && !same_origin(&config.origin, source) {
+        return Err(DataFusionError::Execution(
+            "Flight bearer credentials cannot be forwarded to a different origin".into(),
+        ));
+    }
     let channel = channel_provider.channel(source).await?;
-    let inner_client = flight_service_client(channel, size_limits);
+    let inner_client = flight_service_client(channel, &config.size_limits);
     let mut client = FlightClient::new_from_inner(inner_client);
     client.metadata_mut().clone_from(grpc_headers);
+    if let Some(authorization) = config
+        .properties
+        .authentication()
+        .and_then(FlightAuthentication::authorization_header)
+    {
+        client.metadata_mut().insert(
+            "authorization",
+            authorization.parse().map_err(|_| {
+                DataFusionError::Execution("invalid Flight authorization header".into())
+            })?,
+        );
+    }
     Ok(client)
 }
 
 async fn flight_stream(
     partition: FlightPartition,
-    schema: SchemaRef,
+    config: FlightConfig,
     grpc_headers: Arc<MetadataMap>,
-    size_limits: SizeLimits,
     channel_provider: Arc<dyn FlightChannelProvider>,
 ) -> Result<SendableRecordBatchStream> {
     let mut errors: Vec<Box<dyn Error + Send + Sync>> = vec![];
@@ -202,8 +259,8 @@ async fn flight_stream(
         let get_client = || async {
             flight_client(
                 loc,
+                &config,
                 grpc_headers.as_ref(),
-                &size_limits,
                 channel_provider.as_ref(),
             )
             .await
@@ -215,7 +272,7 @@ async fn flight_stream(
                 continue;
             }
         };
-        match try_fetch_stream(client, &partition.ticket, schema.clone()).await {
+        match try_fetch_stream(client, &partition.ticket, config.schema.clone()).await {
             Ok(stream) => return Ok(stream),
             Err(e) => errors.push(Box::new(e)),
         }
@@ -339,9 +396,8 @@ impl ExecutionPlan for FlightExec {
     ) -> Result<SendableRecordBatchStream> {
         let future_stream = flight_stream(
             self.config.partitions[partition].clone(),
-            self.schema(),
+            self.config.clone(),
             self.metadata_map.clone(),
-            self.config.size_limits,
             self.channel_provider.clone(),
         );
         let stream = futures::stream::once(future_stream).try_flatten();
@@ -354,16 +410,188 @@ impl ExecutionPlan for FlightExec {
 
 #[cfg(test)]
 mod tests {
-    use crate::exec::{enforce_schema, FlightConfig, FlightExec, FlightPartition, FlightTicket};
-    use crate::{DefaultFlightChannelProvider, FlightMetadata, FlightProperties, SizeLimits};
+    use crate::exec::{
+        enforce_schema, flight_client, FlightConfig, FlightExec, FlightPartition, FlightTicket,
+    };
+    use crate::{
+        DefaultFlightChannelProvider, FlightAuthentication, FlightAuthenticationProvider,
+        FlightChannelProvider, FlightMetadata, FlightProperties, SizeLimits,
+    };
     use arrow_flight::FlightInfo;
     use datafusion::arrow::array::{
         BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
     };
     use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
+    use datafusion::common::{DataFusionError, Result};
+    use datafusion::execution::TaskContext;
     use datafusion::physical_plan::ExecutionPlan;
+    use datafusion_proto::physical_plan::PhysicalExtensionCodec;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use tonic::transport::Channel;
+
+    #[derive(Debug)]
+    struct LazyChannels;
+
+    #[async_trait::async_trait]
+    impl FlightChannelProvider for LazyChannels {
+        async fn channel(&self, _endpoint: &str) -> Result<Channel> {
+            Ok(Channel::from_static("http://origin.invalid").connect_lazy())
+        }
+    }
+
+    #[derive(Debug)]
+    struct CapturedAuthentication(Option<FlightAuthentication>);
+
+    impl FlightAuthenticationProvider for CapturedAuthentication {
+        fn restore(
+            &self,
+            _authentication: &FlightAuthentication,
+            _origin: &str,
+            _tickets: &[&[u8]],
+        ) -> Result<FlightAuthentication> {
+            self.0.clone().ok_or_else(|| {
+                DataFusionError::Execution("missing execution authentication".into())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn decoded_scans_use_captured_authentication_without_serializing_credentials() {
+        let cases = [
+            FlightAuthentication::bearer_token("planning-credential"),
+            FlightAuthentication::UsernamePassword {
+                username: Some("private-user".into()),
+                password: Some("private-password".into()),
+                authorization: Some("original-server-session".into()),
+            },
+        ];
+        for authentication in cases {
+            let is_bearer = matches!(authentication, FlightAuthentication::BearerToken { .. });
+            let saved_authentication = authentication.clone();
+            let metadata = FlightMetadata::new(
+                FlightInfo::new().with_endpoint(
+                    arrow_flight::FlightEndpoint::new()
+                        .with_ticket(arrow_flight::Ticket::new(vec![1, 2, 3])),
+                ),
+                FlightProperties::new()
+                    .with_authentication(authentication)
+                    .with_grpc_headers(HashMap::from([("x-static".into(), "retained".into())])),
+                Arc::new(Schema::empty()),
+            );
+            let original = FlightExec::try_new(
+                &metadata,
+                metadata.schema.clone(),
+                "https://origin.invalid",
+                SizeLimits::default(),
+                Arc::new(LazyChannels),
+            )
+            .unwrap();
+            let codec = crate::codec::FlightPhysicalCodec::default()
+                .with_channel_provider(Arc::new(LazyChannels));
+            let mut encoded = Vec::new();
+            codec.try_encode(Arc::new(original), &mut encoded).unwrap();
+            for value in ["first-request-credential", "second-request-credential"] {
+                let restored = if is_bearer {
+                    FlightAuthentication::bearer_token(value)
+                } else {
+                    saved_authentication.clone()
+                };
+                let request_codec =
+                    codec
+                        .clone()
+                        .with_authentication_provider(Arc::new(CapturedAuthentication(Some(
+                            restored.clone(),
+                        ))));
+                let plan = request_codec
+                    .try_decode(&encoded, &[], &TaskContext::default())
+                    .unwrap();
+                let exec = plan.downcast_ref::<FlightExec>().unwrap();
+                assert_eq!(exec.authentication(), Some(&restored));
+                let mut client = flight_client(
+                    "https://origin.invalid/data",
+                    exec.config(),
+                    exec.metadata_map.as_ref(),
+                    exec.channel_provider.as_ref(),
+                )
+                .await
+                .unwrap();
+                let expected = if is_bearer {
+                    value
+                } else {
+                    "original-server-session"
+                };
+                assert_eq!(
+                    client.metadata_mut().get("authorization").unwrap(),
+                    expected
+                );
+                assert_eq!(client.metadata_mut().get("x-static").unwrap(), "retained");
+                let mut reencoded = Vec::new();
+                codec.try_encode(plan, &mut reencoded).unwrap();
+                assert_eq!(reencoded, encoded);
+                let serialized = String::from_utf8(reencoded).unwrap();
+                for secret in [
+                    value,
+                    "planning-credential",
+                    "private-user",
+                    "private-password",
+                    "original-server-session",
+                ] {
+                    assert!(!serialized.contains(secret));
+                }
+            }
+            assert!(crate::codec::FlightPhysicalCodec::default()
+                .try_decode(&encoded, &[], &TaskContext::default())
+                .is_err());
+            assert!(codec
+                .with_authentication_provider(Arc::new(CapturedAuthentication(None)))
+                .try_decode(&encoded, &[], &TaskContext::default())
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn bearer_credentials_are_not_forwarded_to_other_origins() {
+        let properties = FlightProperties::new()
+            .with_authentication(FlightAuthentication::bearer_token("request-credential"));
+        let metadata =
+            FlightMetadata::new(FlightInfo::new(), properties, Arc::new(Schema::empty()));
+        let exec = FlightExec::try_new(
+            &metadata,
+            metadata.schema.clone(),
+            "https://origin.invalid",
+            SizeLimits::default(),
+            Arc::new(LazyChannels),
+        )
+        .unwrap();
+        for destination in [
+            "https://ORIGIN.invalid:443/data",
+            "https://origin.invalid/other",
+        ] {
+            assert!(flight_client(
+                destination,
+                exec.config(),
+                exec.metadata_map.as_ref(),
+                exec.channel_provider.as_ref(),
+            )
+            .await
+            .is_ok());
+        }
+        for destination in [
+            "http://origin.invalid/data",
+            "https://other.invalid/data",
+            "https://origin.invalid:8443/data",
+        ] {
+            assert!(flight_client(
+                destination,
+                exec.config(),
+                exec.metadata_map.as_ref(),
+                exec.channel_provider.as_ref(),
+            )
+            .await
+            .is_err());
+        }
+    }
 
     #[test]
     fn test_flight_config_serde() {

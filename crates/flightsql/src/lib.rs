@@ -26,7 +26,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::access::{connect_and_fetch_metadata, fetch_metadata};
-use crate::exec::FlightExec;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::FlightInfo;
@@ -42,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use tonic::transport::Channel;
 
 mod access;
+mod authentication;
 mod channel;
 pub mod codec;
 mod exec;
@@ -49,8 +49,9 @@ pub mod sql;
 mod sql_gen;
 mod sql_provider;
 
+pub use authentication::{FlightAuthentication, FlightAuthenticationProvider};
 pub use channel::{DefaultFlightChannelProvider, FlightChannelProvider};
-pub use exec::enforce_schema;
+pub use exec::{enforce_schema, FlightExec};
 pub use sql_provider::{
     FlightSqlSource, FlightSqlTable, FlightSqlTableFactory, FlightSqlTableOptions,
 };
@@ -312,6 +313,7 @@ pub struct FlightProperties {
     unbounded_streams: bool,
     grpc_headers: HashMap<String, String>,
     reusable_flight_info: bool,
+    authentication: Option<FlightAuthentication>,
 }
 
 impl FlightProperties {
@@ -339,6 +341,42 @@ impl FlightProperties {
     /// gRPC headers to use on subsequent calls.
     pub fn grpc_headers(&self) -> &HashMap<String, String> {
         &self.grpc_headers
+    }
+
+    pub fn with_authentication(mut self, authentication: FlightAuthentication) -> Self {
+        self.authentication = Some(authentication);
+        self
+    }
+
+    pub fn authentication(&self) -> Option<&FlightAuthentication> {
+        self.authentication.as_ref()
+    }
+
+    pub(crate) fn validate_execution(&self) -> datafusion::common::Result<()> {
+        if let Some(authentication) = &self.authentication {
+            authentication.validate_execution()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_authentication(
+        &mut self,
+        provider: Option<&dyn FlightAuthenticationProvider>,
+        origin: &str,
+        tickets: &[&[u8]],
+    ) -> datafusion::common::Result<()> {
+        if let Some(authentication) = &self.authentication {
+            let provider = provider.ok_or_else(|| {
+                DataFusionError::Execution(
+                    "Flight authentication requires an authentication provider when decoding"
+                        .into(),
+                )
+            })?;
+            let restored = provider.restore(authentication, origin, tickets)?;
+            restored.validate_execution()?;
+            self.authentication = Some(restored);
+        }
+        Ok(())
     }
 
     /// Whether the FlightInfo objects produced by the service can be used multiple times

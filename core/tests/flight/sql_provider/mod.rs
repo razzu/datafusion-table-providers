@@ -17,10 +17,10 @@ use datafusion::physical_plan::{collect, ExecutionPlan, ExecutionPlanProperties}
 use datafusion::prelude::{col, lit, SessionConfig, SessionContext};
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use datafusion_table_providers::flight::codec::FlightPhysicalCodec;
-use datafusion_table_providers::flight::sql::{FlightSqlDriver, PASSWORD, QUERY, USERNAME};
+use datafusion_table_providers::flight::sql::{FlightSqlDriver, QUERY};
 use datafusion_table_providers::flight::{
-    FlightChannelProvider, FlightFactoryOptions, FlightProperties, FlightSqlSource,
-    FlightSqlTableFactory, FlightSqlTableOptions, SizeLimits,
+    FlightAuthentication, FlightChannelProvider, FlightExec, FlightFactoryOptions,
+    FlightProperties, FlightSqlSource, FlightSqlTableFactory, FlightSqlTableOptions, SizeLimits,
 };
 use futures::{StreamExt, TryStreamExt};
 use prost::Message;
@@ -33,20 +33,30 @@ mod fixture;
 use fixture::{MetadataResponse, RecordedRequest, RequestGate, SqlProviderFixture, Submission};
 
 fn factory() -> FlightSqlTableFactory {
-    FlightSqlTableFactory::new(FlightSqlDriver::new().with_persistent_headers(true)).with_options(
-        FlightFactoryOptions::new()
-            .with_properties(FlightProperties::new().with_reusable_flight_info(true)),
-    )
+    FlightSqlTableFactory::new(FlightSqlDriver::new().with_persistent_headers(true))
+        .with_options(FlightFactoryOptions::new().with_properties(properties()))
+}
+
+fn properties() -> FlightProperties {
+    FlightProperties::new()
+        .with_authentication(FlightAuthentication::BearerToken {
+            token: Some("Bearer fixture-token".into()),
+        })
+        .with_reusable_flight_info(true)
+}
+
+fn auth_properties() -> FlightProperties {
+    FlightProperties::new()
+        .with_authentication(FlightAuthentication::username_password("fixture", "test"))
+        .with_reusable_flight_info(true)
+}
+
+fn auth_factory() -> FlightSqlTableFactory {
+    factory().with_options(FlightFactoryOptions::new().with_properties(auth_properties()))
 }
 
 fn options() -> HashMap<String, String> {
-    HashMap::from([
-        (
-            "flight.sql.header.authorization".into(),
-            "Bearer fixture-token".into(),
-        ),
-        ("flight.sql.header.x-fixture-scope".into(), "test".into()),
-    ])
+    HashMap::from([("flight.sql.header.x-fixture-scope".into(), "test".into())])
 }
 
 fn int_values(batches: &[RecordBatch], column: usize) -> Vec<Option<i64>> {
@@ -787,14 +797,6 @@ async fn scan_accepts_stronger_nullability() -> Result<()> {
     fixture.shutdown().await
 }
 
-fn auth_options() -> HashMap<String, String> {
-    let mut options = options();
-    options.remove("flight.sql.header.authorization");
-    options.insert(USERNAME.into(), "fixture".into());
-    options.insert(PASSWORD.into(), "test".into());
-    options
-}
-
 fn rpc_count(requests: &[RecordedRequest], operation: &str) -> usize {
     requests
         .iter()
@@ -845,9 +847,18 @@ fn round_trip(
     channels: Arc<dyn FlightChannelProvider>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let codec = FlightPhysicalCodec::default();
+    let authentication = plan
+        .downcast_ref::<FlightExec>()
+        .and_then(FlightExec::authentication)
+        .cloned();
     let mut bytes = vec![];
     codec.try_encode(plan, &mut bytes)?;
-    let worker = codec.with_channel_provider(channels);
+    let mut worker = codec.with_channel_provider(channels);
+    if let Some(authentication) = authentication {
+        worker = worker.with_authentication_provider(Arc::new(
+            super::FixtureExecutionAuthentication(authentication),
+        ));
+    }
     let decoded = worker.try_decode(&bytes, &[], context.task_ctx().as_ref())?;
     let mut worker_bytes = vec![];
     worker.try_encode(decoded.clone(), &mut worker_bytes)?;
@@ -866,7 +877,7 @@ async fn sql_rpc_headers_and_limits() -> Result<()> {
             let fixture = SqlProviderFixture::start().await?;
             fixture.require_ticket_auth();
             let channels = Arc::new(RecordingChannels::connect(fixture.endpoint()).await?);
-            let request_options = auth_options();
+            let request_options = options();
             let original_options = request_options.clone();
             let table = FlightSqlTableFactory::new(
                 FlightSqlDriver::new().with_persistent_headers(persistent),
@@ -876,9 +887,8 @@ async fn sql_rpc_headers_and_limits() -> Result<()> {
                 FlightFactoryOptions::new()
                     .with_size_limits(SizeLimits::new(32000, 32000))
                     .with_properties(
-                        FlightProperties::new()
+                        auth_properties()
                             .with_unbounded_streams(unbounded)
-                            .with_reusable_flight_info(true)
                             .with_grpc_headers(HashMap::from([
                                 ("x-fixture-scope".into(), "default".into()),
                                 ("x-fixture-default".into(), "retained".into()),
@@ -974,7 +984,9 @@ async fn sql_metadata_message_limits_cover_discovery_and_scan() -> Result<()> {
         let fixture = SqlProviderFixture::start().await?;
         let result = factory()
             .with_options(
-                FlightFactoryOptions::new().with_size_limits(SizeLimits::new(limit, usize::MAX)),
+                FlightFactoryOptions::new()
+                    .with_properties(properties())
+                    .with_size_limits(SizeLimits::new(limit, usize::MAX)),
             )
             .open_table(fixture.endpoint(), FlightSqlSource::table("t")?, options())
             .await;
@@ -1003,7 +1015,9 @@ async fn sql_metadata_message_limits_cover_discovery_and_scan() -> Result<()> {
     for discovery in [true, false] {
         let fixture = SqlProviderFixture::start().await?;
         let factory = factory().with_options(
-            FlightFactoryOptions::new().with_size_limits(SizeLimits::new(usize::MAX, 1024)),
+            FlightFactoryOptions::new()
+                .with_properties(properties())
+                .with_size_limits(SizeLimits::new(usize::MAX, 1024)),
         );
         let oversized = Submission {
             metadata_padding: 4096,
@@ -1048,11 +1062,15 @@ async fn sql_execution_message_limits_survive_codec() -> Result<()> {
         )?;
         let fixture = SqlProviderFixture::start_with_context(server).await?;
         let table = factory()
-            .with_options(FlightFactoryOptions::new().with_size_limits(if encoding {
-                SizeLimits::new(1024, usize::MAX)
-            } else {
-                SizeLimits::new(usize::MAX, 1024)
-            }))
+            .with_options(
+                FlightFactoryOptions::new()
+                    .with_properties(properties())
+                    .with_size_limits(if encoding {
+                        SizeLimits::new(1024, usize::MAX)
+                    } else {
+                        SizeLimits::new(usize::MAX, 1024)
+                    }),
+            )
             .open_table(fixture.endpoint(), FlightSqlSource::table("t")?, options())
             .await?;
         if encoding {
@@ -1085,25 +1103,19 @@ async fn sql_handshake_message_limits_cover_discovery_and_scan() -> Result<()> {
     for scan_failure in [false, true] {
         let fixture = SqlProviderFixture::start().await?;
         fixture.set_handshake_payload_size(4096);
-        factory()
-            .open_table(
-                fixture.endpoint(),
-                FlightSqlSource::table("t")?,
-                auth_options(),
-            )
+        auth_factory()
+            .open_table(fixture.endpoint(), FlightSqlSource::table("t")?, options())
             .await?;
         fixture.set_handshake_payload_size(0);
-        let factory = factory().with_options(
-            FlightFactoryOptions::new().with_size_limits(SizeLimits::new(usize::MAX, 1024)),
+        let factory = auth_factory().with_options(
+            FlightFactoryOptions::new()
+                .with_properties(auth_properties())
+                .with_size_limits(SizeLimits::new(usize::MAX, 1024)),
         );
         let table = if scan_failure {
             Some(
                 factory
-                    .open_table(
-                        fixture.endpoint(),
-                        FlightSqlSource::table("t")?,
-                        auth_options(),
-                    )
+                    .open_table(fixture.endpoint(), FlightSqlSource::table("t")?, options())
                     .await?,
             )
         } else {
@@ -1117,11 +1129,7 @@ async fn sql_handshake_message_limits_cover_discovery_and_scan() -> Result<()> {
                 .unwrap_err()
         } else {
             factory
-                .open_table(
-                    fixture.endpoint(),
-                    FlightSqlSource::table("t")?,
-                    auth_options(),
-                )
+                .open_table(fixture.endpoint(), FlightSqlSource::table("t")?, options())
                 .await
                 .unwrap_err()
         };
@@ -1159,14 +1167,14 @@ async fn sql_opening_has_one_deadline(
     let mut channels = RecordingChannels::connect(fixture.endpoint()).await?;
     channels.delay = Duration::from_millis(acquisition_ms);
     let started = tokio::time::Instant::now();
-    let error = factory()
+    let error = auth_factory()
         .with_channel_provider(Arc::new(channels))
-        .with_options(FlightFactoryOptions::new().with_metadata_timeout(Duration::from_secs(1)))
-        .open_table(
-            fixture.endpoint(),
-            FlightSqlSource::table("t")?,
-            auth_options(),
+        .with_options(
+            FlightFactoryOptions::new()
+                .with_properties(auth_properties())
+                .with_metadata_timeout(Duration::from_secs(1)),
         )
+        .open_table(fixture.endpoint(), FlightSqlSource::table("t")?, options())
         .await
         .unwrap_err();
     assert!(started.elapsed() < Duration::from_secs(2));
@@ -1185,14 +1193,14 @@ async fn sql_scan_has_fresh_deadline() -> Result<()> {
         ..Default::default()
     });
     let channels = Arc::new(RecordingChannels::connect(fixture.endpoint()).await?);
-    let table = factory()
+    let table = auth_factory()
         .with_channel_provider(channels.clone())
-        .with_options(FlightFactoryOptions::new().with_metadata_timeout(Duration::from_millis(250)))
-        .open_table(
-            fixture.endpoint(),
-            FlightSqlSource::table("t")?,
-            auth_options(),
+        .with_options(
+            FlightFactoryOptions::new()
+                .with_properties(auth_properties())
+                .with_metadata_timeout(Duration::from_millis(250)),
         )
+        .open_table(fixture.endpoint(), FlightSqlSource::table("t")?, options())
         .await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let context = SessionContext::new();
@@ -1245,12 +1253,8 @@ async fn sql_authentication_and_permission_errors_are_explicit() -> Result<()> {
             let fixture = SqlProviderFixture::start().await?;
             let table = if scan_failure {
                 Some(
-                    factory()
-                        .open_table(
-                            fixture.endpoint(),
-                            FlightSqlSource::table("t")?,
-                            auth_options(),
-                        )
+                    auth_factory()
+                        .open_table(fixture.endpoint(), FlightSqlSource::table("t")?, options())
                         .await?,
                 )
             } else {
@@ -1275,12 +1279,8 @@ async fn sql_authentication_and_permission_errors_are_explicit() -> Result<()> {
                     .await
                     .unwrap_err()
             } else {
-                factory()
-                    .open_table(
-                        fixture.endpoint(),
-                        FlightSqlSource::table("t")?,
-                        auth_options(),
-                    )
+                auth_factory()
+                    .open_table(fixture.endpoint(), FlightSqlSource::table("t")?, options())
                     .await
                     .unwrap_err()
             };
@@ -1323,12 +1323,8 @@ async fn sql_scan_rejects_invalid_schema_before_execution() -> Result<()> {
 #[tokio::test]
 async fn sql_expired_tickets_are_not_replayed() -> Result<()> {
     let fixture = SqlProviderFixture::start().await?;
-    let table = factory()
-        .open_table(
-            fixture.endpoint(),
-            FlightSqlSource::table("t")?,
-            auth_options(),
-        )
+    let table = auth_factory()
+        .open_table(fixture.endpoint(), FlightSqlSource::table("t")?, options())
         .await?;
     fixture.set_next_submission(Submission {
         expired: true,
@@ -1364,12 +1360,8 @@ async fn sql_expired_tickets_are_not_replayed() -> Result<()> {
 #[tokio::test]
 async fn sql_midstream_failures_are_not_replayed() -> Result<()> {
     let fixture = SqlProviderFixture::start().await?;
-    let table = factory()
-        .open_table(
-            fixture.endpoint(),
-            FlightSqlSource::table("t")?,
-            auth_options(),
-        )
+    let table = auth_factory()
+        .open_table(fixture.endpoint(), FlightSqlSource::table("t")?, options())
         .await?;
     let gate = Arc::new(RequestGate::default());
     fixture.set_next_submission(Submission {
@@ -1412,8 +1404,8 @@ async fn sql_midstream_failures_are_not_replayed() -> Result<()> {
 async fn concurrent_scans_do_not_share_state() -> Result<()> {
     let fixture = SqlProviderFixture::start().await?;
     fixture.require_ticket_auth();
-    let request_options = auth_options();
-    let table = factory()
+    let request_options = options();
+    let table = auth_factory()
         .open_table(
             fixture.endpoint(),
             FlightSqlSource::table("t")?,
@@ -1490,7 +1482,7 @@ async fn concurrent_scans_do_not_share_state() -> Result<()> {
         vec![Some(1)]
     );
     assert_eq!(table.schema(), canonical_schema);
-    assert_eq!(request_options, auth_options());
+    assert_eq!(request_options, options());
     let requests = fixture.requests();
     let submissions = requests
         .iter()
@@ -1536,8 +1528,8 @@ async fn concurrent_scans_do_not_share_state() -> Result<()> {
 #[tokio::test]
 async fn decoded_plan_uses_only_saved_tickets() -> Result<()> {
     const ORIGIN: &str = "http://planner.invalid";
-    const UNAVAILABLE: &str = "http://unavailable.invalid";
-    const ALTERNATE: &str = "http://alternate.invalid";
+    const UNAVAILABLE: &str = "http://planner.invalid/unavailable";
+    const ALTERNATE: &str = "http://planner.invalid/alternate";
     for (name, rows) in [("t", 4), ("empty", 0)] {
         for projection in [vec![0], vec![]] {
             let fixture = SqlProviderFixture::start().await?;
@@ -1546,9 +1538,9 @@ async fn decoded_plan_uses_only_saved_tickets() -> Result<()> {
             let mut worker = RecordingChannels::connect(fixture.endpoint()).await?;
             worker.rejected.push(UNAVAILABLE.into());
             let worker = Arc::new(worker);
-            let table = factory()
+            let table = auth_factory()
                 .with_channel_provider(planner.clone())
-                .open_table(ORIGIN, FlightSqlSource::table(name)?, auth_options())
+                .open_table(ORIGIN, FlightSqlSource::table(name)?, options())
                 .await?;
             fixture.set_next_submission(Submission {
                 locations: vec![
@@ -1638,12 +1630,8 @@ async fn decoded_plan_uses_only_saved_tickets() -> Result<()> {
 #[tokio::test]
 async fn explain_plans_without_fetching_tickets() -> Result<()> {
     let fixture = SqlProviderFixture::start().await?;
-    let table = factory()
-        .open_table(
-            fixture.endpoint(),
-            FlightSqlSource::table("t")?,
-            auth_options(),
-        )
+    let table = auth_factory()
+        .open_table(fixture.endpoint(), FlightSqlSource::table("t")?, options())
         .await?;
     let context = SessionContext::new();
     context.register_table("remote", Arc::new(table))?;
