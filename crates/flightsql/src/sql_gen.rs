@@ -126,7 +126,7 @@ pub(crate) fn classify_filter(
     source: &FlightSqlSource,
     filter: &Expr,
 ) -> Result<TableProviderFilterPushDown> {
-    use TableProviderFilterPushDown::{Inexact, Unsupported};
+    use TableProviderFilterPushDown::{Exact, Unsupported};
 
     match source {
         FlightSqlSource::Query(_) => Ok(Unsupported),
@@ -146,7 +146,7 @@ pub(crate) fn classify_filter(
             {
                 Ok(Unsupported)
             } else {
-                Ok(Inexact)
+                Ok(Exact)
             }
         }
     }
@@ -410,7 +410,7 @@ mod tests {
         ] {
             assert_eq!(
                 classify_filter(&source, &filter).unwrap(),
-                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Exact,
                 "{filter}"
             );
         }
