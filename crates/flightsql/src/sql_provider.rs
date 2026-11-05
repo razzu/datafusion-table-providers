@@ -34,7 +34,9 @@ use crate::access::{connect_and_fetch_metadata, fetch_metadata};
 use crate::exec::FlightExec;
 use crate::sql::{FlightSqlDriver, QUERY};
 use crate::sql_gen::{classify_filter, discovery_sql, normalize_query, scan_sql};
-use crate::{DefaultFlightChannelProvider, FlightChannelProvider, FlightFactoryOptions};
+use crate::{
+    DefaultFlightChannelProvider, FlightAuthentication, FlightChannelProvider, FlightFactoryOptions,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum FlightSqlSource {
@@ -118,6 +120,38 @@ impl FlightSqlTableFactory {
         source: FlightSqlSource,
         options: HashMap<String, String>,
     ) -> Result<FlightSqlTable> {
+        self.open_table_with_options(endpoint, source, options, &self.options)
+            .await
+    }
+
+    /// Discover a SQL source with authentication overriding the factory's defaults.
+    ///
+    /// The override applies to discovery and each scan's metadata request.
+    /// Other settings and the factory's defaults are unchanged. Driver-resolved
+    /// authentication governs execution. Source validation is the same as
+    /// [`Self::open_table`].
+    pub async fn open_table_with_authentication(
+        &self,
+        endpoint: impl Into<String>,
+        source: FlightSqlSource,
+        options: HashMap<String, String>,
+        authentication: FlightAuthentication,
+    ) -> Result<FlightSqlTable> {
+        let mut factory_options = self.options.clone();
+        factory_options.properties = factory_options
+            .properties
+            .with_authentication(authentication);
+        self.open_table_with_options(endpoint, source, options, &factory_options)
+            .await
+    }
+
+    async fn open_table_with_options(
+        &self,
+        endpoint: impl Into<String>,
+        source: FlightSqlSource,
+        options: HashMap<String, String>,
+        factory_options: &FlightFactoryOptions,
+    ) -> Result<FlightSqlTable> {
         let source = source.normalized()?;
         if options.contains_key(QUERY) {
             return Err(DataFusionError::Plan(
@@ -131,7 +165,7 @@ impl FlightSqlTableFactory {
         let (client, metadata) = connect_and_fetch_metadata(
             &origin,
             &self.driver,
-            &self.options,
+            factory_options,
             self.channel_provider.as_ref(),
             &discovery_options,
         )
@@ -160,7 +194,7 @@ impl FlightSqlTableFactory {
             client,
             driver: self.driver.clone(),
             origin,
-            factory_options: self.options.clone(),
+            factory_options: factory_options.clone(),
             channel_provider: self.channel_provider.clone(),
         })
     }

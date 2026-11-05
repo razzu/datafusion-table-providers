@@ -49,6 +49,9 @@ pub mod sql;
 mod sql_gen;
 mod sql_provider;
 
+#[cfg(test)]
+mod tests;
+
 pub use authentication::{FlightAuthentication, FlightAuthenticationProvider};
 pub use channel::{DefaultFlightChannelProvider, FlightChannelProvider};
 pub use exec::{enforce_schema, FlightExec};
@@ -147,11 +150,40 @@ impl FlightTableFactory {
         entry_point: impl Into<String>,
         options: HashMap<String, String>,
     ) -> datafusion::common::Result<FlightTable> {
+        self.open_table_with_options(entry_point, options, &self.options)
+            .await
+    }
+
+    /// Open a table with authentication overriding the factory's default properties.
+    ///
+    /// The override applies to initial metadata acquisition and any metadata
+    /// refreshes for the returned table. Other settings and the factory's
+    /// defaults are unchanged. Driver-resolved authentication governs execution.
+    pub async fn open_table_with_authentication(
+        &self,
+        entry_point: impl Into<String>,
+        options: HashMap<String, String>,
+        authentication: FlightAuthentication,
+    ) -> datafusion::common::Result<FlightTable> {
+        let mut factory_options = self.options.clone();
+        factory_options.properties = factory_options
+            .properties
+            .with_authentication(authentication);
+        self.open_table_with_options(entry_point, options, &factory_options)
+            .await
+    }
+
+    async fn open_table_with_options(
+        &self,
+        entry_point: impl Into<String>,
+        options: HashMap<String, String>,
+        factory_options: &FlightFactoryOptions,
+    ) -> datafusion::common::Result<FlightTable> {
         let origin = entry_point.into();
         let (client, metadata) = connect_and_fetch_metadata(
             &origin,
             self.driver.as_ref(),
-            &self.options,
+            factory_options,
             self.channel_provider.as_ref(),
             &options,
         )
@@ -173,7 +205,7 @@ impl FlightTableFactory {
                 driver: self.driver.clone(),
                 client: Box::new(client),
                 options,
-                factory_options: self.options.clone(),
+                factory_options: factory_options.clone(),
             }
         };
 
@@ -183,7 +215,7 @@ impl FlightTableFactory {
             logical_schema,
             stats,
             channel_provider: self.channel_provider.clone(),
-            size_limits: self.options.size_limits,
+            size_limits: factory_options.size_limits,
         })
     }
 }
@@ -240,6 +272,8 @@ impl FlightFactoryOptions {
 
     /// Default table properties supplied to the driver for each metadata call.
     ///
+    /// `open_table_with_authentication` overrides authentication for one table
+    /// without changing these defaults.
     /// The driver may refine these defaults based on the service's response.
     /// Returned properties govern table scans and execution, not request policy.
     pub fn with_properties(mut self, properties: FlightProperties) -> Self {
