@@ -52,9 +52,7 @@ mod sql_provider;
 pub use authentication::{FlightAuthentication, FlightAuthenticationProvider};
 pub use channel::{DefaultFlightChannelProvider, FlightChannelProvider};
 pub use exec::{enforce_schema, FlightExec};
-pub use sql_provider::{
-    FlightSqlSource, FlightSqlTable, FlightSqlTableFactory, FlightSqlTableOptions,
-};
+pub use sql_provider::{FlightSqlSource, FlightSqlTable, FlightSqlTableFactory};
 
 /// Generic Arrow Flight data source. Requires a [FlightDriver] that allows implementors
 /// to integrate any custom Flight RPC service by producing a [FlightMetadata] for some DDL.

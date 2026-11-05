@@ -26,7 +26,7 @@ use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::{Parser, ParserOptions};
 use datafusion::sql::unparser::{dialect::Dialect, Unparser};
 
-use crate::{FlightSqlSource, FlightSqlTableOptions};
+use crate::FlightSqlSource;
 
 const FLIGHT_SQL_PUSHABLE_FUNCTIONS: &[&str] = &[
     "abs", "ceil", "floor", "round", "sqrt", "exp", "ln", "power", "lower", "upper", "coalesce",
@@ -124,14 +124,12 @@ pub(crate) fn scan_sql(
 
 pub(crate) fn classify_filter(
     source: &FlightSqlSource,
-    table_options: &FlightSqlTableOptions,
     filter: &Expr,
 ) -> Result<TableProviderFilterPushDown> {
     use TableProviderFilterPushDown::{Inexact, Unsupported};
 
     match source {
         FlightSqlSource::Query(_) => Ok(Unsupported),
-        FlightSqlSource::Table(_) if !table_options.pushdown_enabled() => Ok(Unsupported),
         FlightSqlSource::Table(_) => {
             let unsupported_function = filter.exists(|expr| {
                 Ok(matches!(
@@ -174,7 +172,7 @@ mod tests {
     use datafusion::prelude::{col, lit};
 
     use super::{classify_filter, discovery_sql, scan_sql};
-    use crate::{FlightSqlSource, FlightSqlTableOptions};
+    use crate::FlightSqlSource;
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -402,7 +400,6 @@ mod tests {
     #[test]
     fn predicate_renderable_expressions_are_inexact() {
         let source = FlightSqlSource::table("t").unwrap();
-        let options = FlightSqlTableOptions::default().with_datafusion_compatible_pushdown();
         for filter in [
             col("a").gt(col("c")),
             col("text").eq(lit("x")),
@@ -412,7 +409,7 @@ mod tests {
             col("a").is_null().or(col("a").gt(lit(1_i64))).not(),
         ] {
             assert_eq!(
-                classify_filter(&source, &options, &filter).unwrap(),
+                classify_filter(&source, &filter).unwrap(),
                 TableProviderFilterPushDown::Inexact,
                 "{filter}"
             );
@@ -422,7 +419,6 @@ mod tests {
     #[test]
     fn predicate_function_policy_rejects_whole_trees() {
         let source = FlightSqlSource::table("t").unwrap();
-        let options = FlightSqlTableOptions::default().with_datafusion_compatible_pushdown();
         let supported = abs(col("a")).gt(lit(1_i64));
         let unsupported = sin(col("a")).gt(lit(0.5));
         for filter in [
@@ -432,20 +428,19 @@ mod tests {
             supported.clone().or(unsupported).not(),
         ] {
             assert_eq!(
-                classify_filter(&source, &options, &filter).unwrap(),
+                classify_filter(&source, &filter).unwrap(),
                 TableProviderFilterPushDown::Unsupported,
                 "{filter}"
             );
         }
-        for (source, options) in [
-            (source, FlightSqlTableOptions::default()),
-            (FlightSqlSource::query("SELECT * FROM t").unwrap(), options),
-        ] {
-            assert_eq!(
-                classify_filter(&source, &options, &supported).unwrap(),
-                TableProviderFilterPushDown::Unsupported
-            );
-        }
+        assert_eq!(
+            classify_filter(
+                &FlightSqlSource::query("SELECT * FROM t").unwrap(),
+                &supported,
+            )
+            .unwrap(),
+            TableProviderFilterPushDown::Unsupported
+        );
     }
 
     #[test]

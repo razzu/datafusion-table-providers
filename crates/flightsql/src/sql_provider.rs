@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! SQL-specific Flight sources and table options.
+//! SQL-specific Flight sources.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -36,11 +36,6 @@ use crate::sql::{FlightSqlDriver, QUERY};
 use crate::sql_gen::{classify_filter, discovery_sql, normalize_query, scan_sql};
 use crate::{DefaultFlightChannelProvider, FlightChannelProvider, FlightFactoryOptions};
 
-/// A literal remote table identifier or a query used as a derived relation.
-///
-/// Constructors validate and normalize the source without resolving remote
-/// tables or functions locally. Direct enum variants must be normalized again
-/// before opening a table.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum FlightSqlSource {
     /// A single literal identifier, including any dots or embedded quotes.
@@ -56,9 +51,6 @@ impl FlightSqlSource {
     }
 
     /// Parse and normalize one query, removing a final statement terminator.
-    ///
-    /// Syntax validation is not a privilege sandbox. Remote authorization still
-    /// applies, and functions in a query may have side effects.
     pub fn query(sql: impl Into<String>) -> Result<Self> {
         Self::Query(sql.into()).normalized()
     }
@@ -80,37 +72,6 @@ impl FlightSqlSource {
     }
 }
 
-/// SQL-provider policy, separate from Flight transport and authentication options.
-///
-/// Predicate pushdown is disabled by default. Selecting a compatibility policy
-/// is a caller assertion about the remote service, not capability discovery.
-#[derive(Clone, Debug, Default)]
-pub struct FlightSqlTableOptions {
-    datafusion_compatible_pushdown: bool,
-}
-
-impl FlightSqlTableOptions {
-    /// Enable renderable table predicates with a DataFusion-compatible function allowlist.
-    ///
-    /// The remote SQL engine must support the emitted expressions and allowlisted
-    /// functions with compatible semantics. This setting does not discover server
-    /// capabilities. Filters remain inexact and are rechecked locally; DataFusion
-    /// controls safe limit pushdown.
-    ///
-    /// Allowlisted functions: `abs`, `ceil`, `floor`, `round`, `sqrt`, `exp`,
-    /// `ln`, `power`, `lower`, `upper`, and `coalesce`.
-    ///
-    /// Query-source outer filters remain local regardless of this setting.
-    pub fn with_datafusion_compatible_pushdown(mut self) -> Self {
-        self.datafusion_compatible_pushdown = true;
-        self
-    }
-
-    pub(crate) fn pushdown_enabled(&self) -> bool {
-        self.datafusion_compatible_pushdown
-    }
-}
-
 /// Opens SQL sources using full-schema discovery and fresh tickets for each scan.
 ///
 /// Discovery and projection require DataFusion-compatible SQL syntax. No remote
@@ -120,7 +81,6 @@ pub struct FlightSqlTableFactory {
     driver: FlightSqlDriver,
     options: FlightFactoryOptions,
     channel_provider: Arc<dyn FlightChannelProvider>,
-    table_options: FlightSqlTableOptions,
 }
 
 impl FlightSqlTableFactory {
@@ -129,7 +89,6 @@ impl FlightSqlTableFactory {
             driver,
             options: FlightFactoryOptions::default(),
             channel_provider: Arc::new(DefaultFlightChannelProvider),
-            table_options: FlightSqlTableOptions::default(),
         }
     }
 
@@ -147,12 +106,6 @@ impl FlightSqlTableFactory {
         channel_provider: Arc<dyn FlightChannelProvider>,
     ) -> Self {
         self.channel_provider = channel_provider;
-        self
-    }
-
-    /// Select SQL-specific policy separately from transport/authentication options.
-    pub fn with_table_options(mut self, table_options: FlightSqlTableOptions) -> Self {
-        self.table_options = table_options;
         self
     }
 
@@ -204,7 +157,6 @@ impl FlightSqlTableFactory {
             source,
             logical_schema,
             options,
-            table_options: self.table_options.clone(),
             client,
             driver: self.driver.clone(),
             origin,
@@ -224,7 +176,6 @@ pub struct FlightSqlTable {
     source: FlightSqlSource,
     logical_schema: SchemaRef,
     options: HashMap<String, String>,
-    table_options: FlightSqlTableOptions,
     client: FlightServiceClient<Channel>,
     driver: FlightSqlDriver,
     origin: String,
@@ -294,7 +245,7 @@ impl TableProvider for FlightSqlTable {
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         filters
             .iter()
-            .map(|filter| classify_filter(&self.source, &self.table_options, filter))
+            .map(|filter| classify_filter(&self.source, filter))
             .collect()
     }
 
