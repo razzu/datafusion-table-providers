@@ -20,9 +20,7 @@
 use std::sync::Arc;
 
 use crate::exec::{FlightConfig, FlightExec};
-use crate::{
-    to_df_err, DefaultFlightChannelProvider, FlightAuthenticationProvider, FlightChannelProvider,
-};
+use crate::{to_df_err, DefaultFlightChannelProvider, FlightAuthorization, FlightChannelProvider};
 use datafusion::common::DataFusionError;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
@@ -32,14 +30,12 @@ use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 #[derive(Clone, Debug)]
 pub struct FlightPhysicalCodec {
     channel_provider: Arc<dyn FlightChannelProvider>,
-    authentication_provider: Option<Arc<dyn FlightAuthenticationProvider>>,
 }
 
 impl Default for FlightPhysicalCodec {
     fn default() -> Self {
         Self {
-            channel_provider: Arc::new(DefaultFlightChannelProvider),
-            authentication_provider: None,
+            channel_provider: Arc::new(DefaultFlightChannelProvider::default()),
         }
     }
 }
@@ -56,15 +52,6 @@ impl FlightPhysicalCodec {
         self.channel_provider = channel_provider;
         self
     }
-
-    /// Restore runtime authentication from caller-supplied provider state.
-    pub fn with_authentication_provider(
-        mut self,
-        provider: Arc<dyn FlightAuthenticationProvider>,
-    ) -> Self {
-        self.authentication_provider = Some(provider);
-        self
-    }
 }
 
 impl PhysicalExtensionCodec for FlightPhysicalCodec {
@@ -72,11 +59,16 @@ impl PhysicalExtensionCodec for FlightPhysicalCodec {
         &self,
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
-        _registry: &TaskContext,
+        registry: &TaskContext,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         if inputs.is_empty() {
             let mut config: FlightConfig = serde_json::from_slice(buf).map_err(to_df_err)?;
-            config.restore_authentication(self.authentication_provider.as_deref())?;
+            let authorization = registry
+                .session_config()
+                .get_extension::<FlightAuthorization>();
+            config
+                .properties
+                .restore_authorization(authorization.as_deref())?;
             Ok(Arc::new(FlightExec::from_config(
                 config,
                 self.channel_provider.clone(),
@@ -94,8 +86,9 @@ impl PhysicalExtensionCodec for FlightPhysicalCodec {
         buf: &mut Vec<u8>,
     ) -> datafusion::common::Result<()> {
         if let Some(flight) = node.downcast_ref::<FlightExec>() {
-            flight.config().properties.validate_execution()?;
-            let mut bytes = serde_json::to_vec(flight.config()).map_err(to_df_err)?;
+            let mut config = flight.config().clone();
+            config.properties = config.properties.without_authorization();
+            let mut bytes = serde_json::to_vec(&config).map_err(to_df_err)?;
             buf.append(&mut bytes);
             Ok(())
         } else {
@@ -114,13 +107,17 @@ mod tests {
     use arrow_flight::{FlightEndpoint, FlightInfo, Location, Ticket};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::execution::TaskContext;
+    use datafusion::prelude::SessionConfig;
     use datafusion::physical_plan::ExecutionPlanProperties;
     use datafusion_proto::physical_plan::PhysicalExtensionCodec;
     use serde_json::json;
 
     use super::FlightPhysicalCodec;
     use crate::exec::FlightExec;
-    use crate::{DefaultFlightChannelProvider, FlightMetadata, FlightProperties, SizeLimits};
+    use crate::{
+        DefaultFlightChannelProvider, FlightAuthorization, FlightMetadata, FlightProperties,
+        SizeLimits,
+    };
 
     #[test]
     fn explicit_schema_round_trip_preserves_execution_configuration() {
@@ -168,14 +165,18 @@ mod tests {
             let properties = FlightProperties::new()
                 .with_reusable_flight_info(true)
                 .with_unbounded_streams(true)
-                .with_grpc_headers(HashMap::from([("x-fixture".into(), "codec".into())]));
+                .with_requires_authorization(true)
+                .with_grpc_headers(HashMap::from([
+                    ("x-fixture".into(), "codec".into()),
+                    ("authorization".into(), "secret".into()),
+                ]));
             let metadata = FlightMetadata::try_new(info, properties).unwrap();
             let exec = FlightExec::try_new(
                 &metadata,
                 output_schema.clone(),
                 "http://origin.invalid",
                 SizeLimits::new(1024, 2048),
-                Arc::new(DefaultFlightChannelProvider),
+                Arc::new(DefaultFlightChannelProvider::default()),
             )
             .unwrap();
             let codec = FlightPhysicalCodec::default();
@@ -203,14 +204,24 @@ mod tests {
                             "x-fixture": "codec"
                         },
                         "reusable_flight_info": true,
-                        "authentication": null
+                        "requires_authorization": true
                     },
                     "size_limits": {"encoding": 1024, "decoding": 2048}
                 })
             );
-            let decoded = codec
+            assert!(codec
                 .try_decode(&bytes, &[], &TaskContext::default())
-                .unwrap();
+                .is_err());
+            let task_ctx = TaskContext::default().with_session_config(
+                SessionConfig::new()
+                    .with_extension(Arc::new(FlightAuthorization("request-secret".into()))),
+            );
+            let decoded = codec.try_decode(&bytes, &[], &task_ctx).unwrap();
+            let decoded_exec = decoded.downcast_ref::<FlightExec>().unwrap();
+            assert_eq!(
+                decoded_exec.config().properties.grpc_headers()["authorization"],
+                "request-secret"
+            );
             assert_eq!(decoded.schema(), output_schema);
             assert_eq!(decoded.output_partitioning().partition_count(), 3);
             let mut reencoded = vec![];

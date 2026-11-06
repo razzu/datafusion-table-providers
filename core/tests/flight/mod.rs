@@ -29,7 +29,7 @@ use tonic::{Extensions, Request, Response, Status, Streaming};
 
 use datafusion_table_providers::flight::sql::FlightSqlDriver;
 use datafusion_table_providers::flight::{
-    FlightAuthentication, FlightFactoryOptions, FlightProperties, FlightTableFactory,
+    FlightFactoryOptions, FlightProperties, FlightTableFactory,
 };
 
 const AUTH_HEADER: &str = "authorization";
@@ -193,9 +193,7 @@ async fn test_flight_sql_data_source() -> datafusion::common::Result<()> {
     };
     let port = service.run_in_background(rx).await.port();
     let ctx = SessionContext::new();
-    let properties = FlightProperties::new()
-        .with_reusable_flight_info(true)
-        .with_authentication(FlightAuthentication::username_password("admin", "password"));
+    let properties = FlightProperties::new().with_reusable_flight_info(true);
     let driver = FlightSqlDriver::new();
     ctx.state_ref().write().table_factories_mut().insert(
         "FLIGHT_SQL".into(),
@@ -210,6 +208,8 @@ async fn test_flight_sql_data_source() -> datafusion::common::Result<()> {
         CREATE EXTERNAL TABLE fsql STORED AS FLIGHT_SQL
         LOCATION 'http://localhost:{port}'
         OPTIONS(
+            'flight.sql.username' 'admin',
+            'flight.sql.password' 'password',
             'flight.sql.query' '{query}',
             'flight.sql.header.custom-hdr1' 'v1',
             'flight.sql.header.custom-hdr2' 'v2',

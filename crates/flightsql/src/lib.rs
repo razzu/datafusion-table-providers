@@ -17,7 +17,6 @@
 
 //! Generic [FlightTableFactory] that can connect to Arrow Flight services,
 //! with a [sql::FlightSqlDriver] provided out-of-the-box.
-//! [FlightSqlTableFactory] adds typed SQL sources, schema discovery, and scan projection.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -40,22 +39,14 @@ use datafusion::physical_plan::ExecutionPlan;
 use serde::{Deserialize, Serialize};
 use tonic::transport::Channel;
 
-mod access;
-mod authentication;
+pub mod access;
 mod channel;
 pub mod codec;
 mod exec;
 pub mod sql;
-mod sql_gen;
-mod sql_provider;
 
-#[cfg(test)]
-mod tests;
-
-pub use authentication::{FlightAuthentication, FlightAuthenticationProvider};
 pub use channel::{DefaultFlightChannelProvider, FlightChannelProvider};
 pub use exec::{enforce_schema, FlightExec};
-pub use sql_provider::{FlightSqlSource, FlightSqlTable, FlightSqlTableFactory};
 
 /// Generic Arrow Flight data source. Requires a [FlightDriver] that allows implementors
 /// to integrate any custom Flight RPC service by producing a [FlightMetadata] for some DDL.
@@ -122,7 +113,7 @@ impl FlightTableFactory {
     pub fn new(driver: Arc<dyn FlightDriver>) -> Self {
         Self {
             driver,
-            channel_provider: Arc::new(DefaultFlightChannelProvider),
+            channel_provider: Arc::new(DefaultFlightChannelProvider::default()),
             options: FlightFactoryOptions::default(),
         }
     }
@@ -151,25 +142,6 @@ impl FlightTableFactory {
         options: HashMap<String, String>,
     ) -> datafusion::common::Result<FlightTable> {
         self.open_table_with_options(entry_point, options, &self.options)
-            .await
-    }
-
-    /// Open a table with authentication overriding the factory's default properties.
-    ///
-    /// The override applies to initial metadata acquisition and any metadata
-    /// refreshes for the returned table. Other settings and the factory's
-    /// defaults are unchanged. Driver-resolved authentication governs execution.
-    pub async fn open_table_with_authentication(
-        &self,
-        entry_point: impl Into<String>,
-        options: HashMap<String, String>,
-        authentication: FlightAuthentication,
-    ) -> datafusion::common::Result<FlightTable> {
-        let mut factory_options = self.options.clone();
-        factory_options.properties = factory_options
-            .properties
-            .with_authentication(authentication);
-        self.open_table_with_options(entry_point, options, &factory_options)
             .await
     }
 
@@ -239,9 +211,9 @@ impl TableProviderFactory for FlightTableFactory {
 /// Only execution settings, not metadata deadlines, are serialized into plans.
 #[derive(Clone, Debug, Default)]
 pub struct FlightFactoryOptions {
-    size_limits: SizeLimits,
-    metadata_timeout: Option<Duration>,
-    properties: FlightProperties,
+    pub size_limits: SizeLimits,
+    pub metadata_timeout: Option<Duration>,
+    pub properties: FlightProperties,
 }
 
 impl FlightFactoryOptions {
@@ -272,8 +244,6 @@ impl FlightFactoryOptions {
 
     /// Default table properties supplied to the driver for each metadata call.
     ///
-    /// `open_table_with_authentication` overrides authentication for one table
-    /// without changing these defaults.
     /// The driver may refine these defaults based on the service's response.
     /// Returned properties govern table scans and execution, not request policy.
     pub fn with_properties(mut self, properties: FlightProperties) -> Self {
@@ -309,7 +279,7 @@ pub struct FlightMetadata {
     /// Driver-resolved table semantics and execution headers
     props: FlightProperties,
     /// Arrow schema. Can be enforced by the driver or inferred from the FlightInfo
-    schema: SchemaRef,
+    pub schema: SchemaRef,
 }
 
 impl FlightMetadata {
@@ -345,7 +315,7 @@ pub struct FlightProperties {
     unbounded_streams: bool,
     grpc_headers: HashMap<String, String>,
     reusable_flight_info: bool,
-    authentication: Option<FlightAuthentication>,
+    requires_authorization: bool,
 }
 
 impl FlightProperties {
@@ -359,56 +329,20 @@ impl FlightProperties {
         self
     }
 
-    /// Whether the service will produce infinite streams.
-    pub fn unbounded_streams(&self) -> bool {
-        self.unbounded_streams
-    }
-
     /// gRPC headers to use on subsequent calls.
     pub fn with_grpc_headers(mut self, grpc_headers: HashMap<String, String>) -> Self {
         self.grpc_headers = grpc_headers;
         self
     }
 
-    /// gRPC headers to use on subsequent calls.
-    pub fn grpc_headers(&self) -> &HashMap<String, String> {
-        &self.grpc_headers
-    }
-
-    pub fn with_authentication(mut self, authentication: FlightAuthentication) -> Self {
-        self.authentication = Some(authentication);
+    pub fn add_grpc_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.grpc_headers.insert(key.into(), value.into());
         self
     }
 
-    pub fn authentication(&self) -> Option<&FlightAuthentication> {
-        self.authentication.as_ref()
-    }
-
-    pub(crate) fn validate_execution(&self) -> datafusion::common::Result<()> {
-        if let Some(authentication) = &self.authentication {
-            authentication.validate_execution()?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn restore_authentication(
-        &mut self,
-        provider: Option<&dyn FlightAuthenticationProvider>,
-        origin: &str,
-        tickets: &[&[u8]],
-    ) -> datafusion::common::Result<()> {
-        if let Some(authentication) = &self.authentication {
-            let provider = provider.ok_or_else(|| {
-                DataFusionError::Execution(
-                    "Flight authentication requires an authentication provider when decoding"
-                        .into(),
-                )
-            })?;
-            let restored = provider.restore(authentication, origin, tickets)?;
-            restored.validate_execution()?;
-            self.authentication = Some(restored);
-        }
-        Ok(())
+    /// gRPC headers to use on subsequent calls.
+    pub fn grpc_headers(&self) -> &HashMap<String, String> {
+        &self.grpc_headers
     }
 
     /// Whether the FlightInfo objects produced by the service can be used multiple times
@@ -418,9 +352,56 @@ impl FlightProperties {
         self
     }
 
-    /// Whether the FlightInfo can be reused without refreshing it before a scan.
-    pub fn reusable_flight_info(&self) -> bool {
-        self.reusable_flight_info
+    /// Whether execution requires an `authorization` header.
+    ///
+    /// The header is never serialized; the codec restores it when decoding.
+    pub fn with_requires_authorization(mut self, requires_authorization: bool) -> Self {
+        self.requires_authorization = requires_authorization;
+        self
+    }
+
+    pub fn requires_authorization(&self) -> bool {
+        self.requires_authorization
+    }
+
+    /// Re-attach the `authorization` header when execution requires it.
+    pub(crate) fn restore_authorization(
+        &mut self,
+        authorization: Option<&FlightAuthorization>,
+    ) -> datafusion::common::Result<()> {
+        if !self.requires_authorization {
+            return Ok(());
+        }
+        let authorization = authorization.ok_or_else(|| {
+            DataFusionError::Execution(
+                "Flight scan requires an authorization header in the session config".into(),
+            )
+        })?;
+        self.grpc_headers
+            .insert(AUTHORIZATION_HEADER.into(), authorization.0.clone());
+        Ok(())
+    }
+
+    /// A copy without the `authorization` header, safe to serialize.
+    pub(crate) fn without_authorization(&self) -> Self {
+        let mut properties = self.clone();
+        properties
+            .grpc_headers
+            .retain(|name, _| !name.eq_ignore_ascii_case(AUTHORIZATION_HEADER));
+        properties
+    }
+}
+
+/// Execution `authorization` header value, supplied as a session config extension.
+///
+/// Decoded plans with [`FlightProperties::requires_authorization`] take their
+/// `authorization` header from this extension, since it is never serialized.
+#[derive(Clone)]
+pub struct FlightAuthorization(pub String);
+
+impl Debug for FlightAuthorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FlightAuthorization(<redacted>)")
     }
 }
 
@@ -535,6 +516,8 @@ impl TableProvider for FlightTable {
         Some(self.stats.clone())
     }
 }
+
+const AUTHORIZATION_HEADER: &str = "authorization";
 
 fn to_df_err<E: Error + Send + Sync + 'static>(err: E) -> DataFusionError {
     DataFusionError::External(Box::new(err))

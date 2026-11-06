@@ -231,25 +231,6 @@ roapi -t taxi=https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_20
 cargo run -p datafusion-table-providers --example flight-sql --features flight
 ```
 
-Reuse a `FlightTableFactory` across user requests by passing authentication
-directly instead of cloning and reconfiguring the factory:
-
-```rust
-let table = factory
-    .open_table_with_authentication(
-        endpoint,
-        options,
-        FlightAuthentication::bearer_token(format!("Bearer {token}")),
-    )
-    .await?;
-```
-
-`FlightSqlTableFactory` provides the same method with its existing `source`
-argument before `options`. The override replaces the authentication in the
-factory's default `FlightProperties` for the returned table, including subsequent
-metadata refreshes and scans. Other settings and factory defaults are unchanged;
-`open_table` continues to use the configured defaults.
-
 ### ADBC
 
 Install an ADBC driver using [dbc](https://github.com/columnar-tech/dbc):

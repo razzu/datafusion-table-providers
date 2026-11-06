@@ -20,10 +20,13 @@
 use std::fmt::Debug;
 
 use async_trait::async_trait;
-use datafusion::common::Result;
+use datafusion::common::{DataFusionError, Result};
+use moka::sync::Cache;
 use tonic::transport::{Channel, ClientTlsConfig};
 
 use crate::to_df_err;
+
+const CHANNEL_CACHE_SIZE: u64 = 1024;
 
 /// Supplies channels for Flight RPCs.
 ///
@@ -36,20 +39,31 @@ pub trait FlightChannelProvider: Send + Sync + Debug {
     async fn channel(&self, endpoint: &str) -> Result<Channel>;
 }
 
-/// Establishes a new channel on every acquisition, using the enabled TLS roots.
-#[derive(Clone, Debug, Default)]
-pub struct DefaultFlightChannelProvider;
+/// Caches one lazily connected channel per endpoint, using the enabled TLS roots.
+#[derive(Clone, Debug)]
+pub struct DefaultFlightChannelProvider {
+    channels: Cache<String, Channel>,
+}
+
+impl Default for DefaultFlightChannelProvider {
+    fn default() -> Self {
+        Self {
+            channels: Cache::new(CHANNEL_CACHE_SIZE),
+        }
+    }
+}
 
 #[async_trait]
 impl FlightChannelProvider for DefaultFlightChannelProvider {
     async fn channel(&self, endpoint: &str) -> Result<Channel> {
-        let tls_config = ClientTlsConfig::new().with_enabled_roots();
-        Channel::from_shared(endpoint.to_owned())
-            .map_err(to_df_err)?
-            .tls_config(tls_config)
-            .map_err(to_df_err)?
-            .connect()
-            .await
-            .map_err(to_df_err)
+        self.channels
+            .try_get_with_by_ref(endpoint, || {
+                Channel::from_shared(endpoint.to_owned())
+                    .map_err(to_df_err)?
+                    .tls_config(ClientTlsConfig::new().with_enabled_roots())
+                    .map_err(to_df_err)
+                    .map(|endpoint| endpoint.connect_lazy())
+            })
+            .map_err(DataFusionError::Shared)
     }
 }
